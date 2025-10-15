@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
@@ -11,9 +12,12 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@crypto-bot/sdk": "^0.0.0",
+    "@notionhq/client": "^5.1.0",
     "axios": "^1.12.2",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
+    "node-fetch": "^3.0.0",
     "node-telegram-bot-api": "^0.66.0",
     "telegraf": "^4.16.3"
   },

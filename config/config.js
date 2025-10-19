@@ -18,6 +18,6 @@ export default {
   },
   
   PRICES: {
-    ADAPTATION: process.env.PRODUCT_PRICE
+    ADAPTATION: process.env.PRODUCT_PRIC
   }
 };

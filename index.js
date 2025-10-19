@@ -323,7 +323,7 @@ function createLocalizationsKeyboard(selectedIds = []) {
 
 // Функция для расчета стоимости заказа
 function calculateOrderPrice(order) {
-  const pricePerAdaptation = config.PRICES.ADAPTATION; // цена за адаптацию
+  const pricePerAdaptation = 10; // цена за адаптацию
   const adaptationsPrice = order.adaptationsCount * pricePerAdaptation;
   
   return {

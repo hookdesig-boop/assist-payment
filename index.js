@@ -12,6 +12,7 @@ const cryptoBot = new CryptoBotService(bot);
 // Добавляем сессии
 bot.use(session());
 
+
 // Хранилище для pending платежей (в продакшене замените на БД)
 const pendingPayments = new Map();
 

@@ -281,12 +281,33 @@ const getLocalizations = localization();
 
 // Функция для создания клавиатуры валют
 function createCurrencyKeyboard() {
-  const currencies = [
+const currencies = [
     { code: 'USD', name: '💵 Доллар США' },
     { code: 'EUR', name: '💶 Евро' },
+    { code: 'GBP', name: '💷 Фунт стерлингов' },
+    { code: 'JPY', name: '💴 Иена' },
+    { code: 'CNY', name: '🇨🇳 Юань' },
+    { code: 'CHF', name: '🇨🇭 Франк' },
+    { code: 'CAD', name: '🇨🇦 Канадский доллар' },
+    { code: 'AUD', name: '🇦🇺 Австралийский доллар' },
     { code: 'UAH', name: '🇺🇦 Гривна' },
-    { code: 'RUB', name: '🇷🇺 Рубль' }
-  ];
+    { code: 'RUB', name: '🇷🇺 Рубль' },
+    { code: 'PLN', name: '🇵🇱 Злотый' },
+    { code: 'CZK', name: '🇨🇿 Чешская крона' },
+    { code: 'TRY', name: '🇹🇷 Лира' },
+    { code: 'INR', name: '🇮🇳 Рупия' },
+    { code: 'BRL', name: '🇧🇷 Реал' },
+    { code: 'KRW', name: '🇰🇷 Вона' },
+    { code: 'SGD', name: '🇸🇬 Сингапурский доллар' },
+    { code: 'HKD', name: '🇭🇰 Гонконгский доллар' },
+    { code: 'SEK', name: '🇸🇪 Шведская крона' },
+    { code: 'NOK', name: '🇳🇴 Норвежская крона' },
+    { code: 'DKK', name: '🇩🇰 Датская крона' },
+    { code: 'AED', name: '🇦🇪 Дирхам' },
+    { code: 'ILS', name: '🇮🇱 Шекель' },
+    { code: 'KZT', name: '🇰🇿 Тенге' },
+    { code: 'BYN', name: '🇧🇾 Белорусский рубль' }
+];
   
   const buttons = currencies.map(currency => 
     Markup.button.callback(currency.name, `currency_${currency.code}`)

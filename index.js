@@ -642,7 +642,7 @@ bot.action('check_payment', async (ctx) => {
     return;
   }
   
-  await ctx.editMessageText('🔍 Проверяем статус оплаты...');
+  await ctx.editMessageText('🔍 Проверяем статус оплаты... Пожалуйста подождите подтверждения перед созданием нового заказа');
   
   try {
     const paymentStatus = await cryptoBot.checkPaymentStatus(invoiceId);

@@ -88,21 +88,43 @@ export async function createNotionTask(props) {
     orderNumber,
     userId,
     adaptationsCount,
-    localizations,
+    adaptations, // новый параметр - массив адаптаций
+    localizations, // старый параметр (для обратной совместимости)
     bank,
     winningAmount,
-    currency,
+    currency, // старый параметр (для обратной совместимости)
     additionalInfo,
     paymentStatus = "paid",
+    invoiceId
   } = props;
 
   try {
     console.log("📤 Sending to Notion:", props);
 
-    // Преобразуем массив локализаций в строку
-    const localizationsText = Array.isArray(localizations)
-      ? localizations.join(", ")
-      : localizations;
+    // Поддержка обратной совместимости
+    let adaptationsList = adaptations;
+    if (!adaptationsList && localizations) {
+      // Конвертируем старый формат в новый
+      adaptationsList = [{
+        localization: Array.isArray(localizations) ? localizations.join(', ') : localizations,
+        currency: currency || 'USD'
+      }];
+    }
+
+    // Форматируем информацию об адаптациях для Notion
+    let localizationsText = "";
+    let currenciesText = "";
+
+    if (adaptationsList && adaptationsList.length > 0) {
+      localizationsText = adaptationsList.map(adapt => adapt.localization).join(", ");
+      currenciesText = adaptationsList.map(adapt => adapt.currency).join(", ");
+    } else {
+      // Старый формат для обратной совместимости
+      localizationsText = Array.isArray(localizations)
+        ? localizations.join(", ")
+        : localizations || "";
+      currenciesText = currency || "USD";
+    }
 
     const properties = {
       // Название страницы (обязательное поле)
@@ -131,12 +153,21 @@ export async function createNotionTask(props) {
       AdaptationsCount: {
         number: parseInt(adaptationsCount) || 0,
       },
-      // Локализации
+      // Локализации (все выбранные локализации через запятую)
       Localization: {
         rich_text: [
           {
             type: "text",
             text: { content: localizationsText || "" },
+          },
+        ],
+      },
+      // Валюты (все выбранные валюты через запятую)
+      Currency: {
+        rich_text: [
+          {
+            type: "text",
+            text: { content: currenciesText || (currency || "USD") },
           },
         ],
       },
@@ -153,12 +184,6 @@ export async function createNotionTask(props) {
       WinningAmount: {
         number: parseFloat(winningAmount) || 0,
       },
-      // Валюта
-      Currency: {
-        select: {
-          name: currency || "USD",
-        },
-      },
       // Дополнительная информация
       AdditionalInfo: {
         rich_text: [
@@ -168,9 +193,33 @@ export async function createNotionTask(props) {
           },
         ],
       },
+      // Детали адаптаций (новая колонка для подробной информации)
+      AdaptationsDetails: {
+        rich_text: [
+          {
+            type: "text",
+            text: { 
+              content: adaptationsList 
+                ? adaptationsList.map((adapt, index) => 
+                    `Адаптация ${index + 1}: ${adapt.localization} (${adapt.currency})`
+                  ).join('\n')
+                : `${adaptationsCount} адаптаций` 
+            },
+          },
+        ],
+      },
+      // ID инвойса
+      InvoiceID: {
+        rich_text: [
+          {
+            type: "text",
+            text: { content: invoiceId || "" },
+          },
+        ],
+      },
       // Ссылка на готовое видео (пустое поле для будущего использования)
       VideoLink: {
-        url: null, // Пустая ссылка, будет заполнена позже
+        url: null,
       },
       // Статус оплаты
       PaymentStatus: {

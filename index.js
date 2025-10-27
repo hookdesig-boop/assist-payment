@@ -1,824 +1,886 @@
-import { Telegraf, session, Markup } from 'telegraf';
-import config from './config/config.js';
-
-import { createNotionTask, processAndSendLinks } from './src/utils/notion.js';
-import { setupBotCommands } from './src/components/notionNotifier.js';
-import { CryptoBotService } from './src/utils/cryptoBot.js';
-import { localization } from './src/utils/localization.js';
-import { currency } from './src/utils/currencys.js';
+import { Telegraf, session, Markup } from "telegraf";
+import config from "./config/config.js";
+import { createNotionTask, processAndSendLinks } from "./src/utils/notion.js";
+import { setupBotCommands } from "./src/components/notionNotifier.js";
+import { CryptoBotService } from "./src/utils/cryptoBot.js";
+import { localization } from "./src/utils/localization.js";
+import { currency } from "./src/utils/currencys.js";
+import EnhancedActivityManager from "./src/utils/active.js";
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const cryptoBot = new CryptoBotService(bot);
+const activityManager = new EnhancedActivityManager(bot);
 
 // Добавляем сессии
 bot.use(session());
 
-
-// Хранилище для pending платежей (в продакшене замените на БД)
+// Хранилище для pending платежей
 const pendingPayments = new Map();
 
 // Переменные для хранения интервалов
-let autoCheckInterval = null;
-let paymentCheckInterval = null;
+global.paymentCheckInterval = null;
+global.autoCheckInterval = null;
 
-// ========== СИСТЕМА АВТОМАТИЧЕСКОЙ ПРОВЕРКИ ПЛАТЕЖЕЙ ==========
+// ========== УТИЛИТЫ ДЛЯ ОТЛАДКИ ==========
 
-// Функция для сохранения pending платежа
+function debugSession(ctx) {
+  console.log('🔍 DEBUG SESSION:', {
+    userId: ctx.from?.id,
+    session: ctx.session,
+    invoiceId: ctx.session?.invoiceId,
+    pendingPaymentsSize: pendingPayments.size,
+    pendingPayments: Array.from(pendingPayments.entries()).map(([id, data]) => ({
+      invoiceId: id,
+      userId: data.userId,
+      orderNumber: data.order?.orderNumber
+    }))
+  });
+}
+
+// ========== СИСТЕМА ПРОВЕРКИ ПЛАТЕЖЕЙ ==========
+
 function savePendingPayment(invoiceId, paymentData) {
   pendingPayments.set(invoiceId, {
     ...paymentData,
     createdAt: new Date(),
     checkedAt: null,
-    attempts: 0
+    attempts: 0,
   });
-  console.log(`💾 Сохранен pending платеж: ${invoiceId} для заказа #${paymentData.order.orderNumber}`);
+  console.log(`💾 Сохранен pending платеж: ${invoiceId}`);
 }
 
-// Функция для получения pending платежа
 function getPendingPayment(invoiceId) {
   return pendingPayments.get(invoiceId);
 }
 
-// Функция для удаления pending платежа
 function removePendingPayment(invoiceId) {
   pendingPayments.delete(invoiceId);
   console.log(`🗑️ Удален pending платеж: ${invoiceId}`);
 }
 
-// Функция автоматической проверки pending платежей
 async function checkPendingPayments() {
   try {
     if (pendingPayments.size === 0) return;
 
     console.log(`🔍 Проверка ${pendingPayments.size} pending платежей...`);
-    
-    let processed = 0;
-    let errors = 0;
 
     for (const [invoiceId, paymentData] of pendingPayments.entries()) {
       try {
-        // Проверяем только раз в 30 секунд для одного инвойса
-        if (paymentData.checkedAt && (Date.now() - paymentData.checkedAt) < 30000) {
+        if (
+          paymentData.checkedAt &&
+          Date.now() - paymentData.checkedAt < 30000
+        ) {
           continue;
         }
 
-        // Увеличиваем счетчик попыток
         paymentData.attempts += 1;
         paymentData.checkedAt = Date.now();
 
-        console.log(`🔍 Проверка инвойса ${invoiceId} (попытка ${paymentData.attempts})`);
-
-        // Проверяем статус платежа через CryptoBot
         const paymentStatus = await cryptoBot.checkPaymentStatus(invoiceId);
-        
-        if (paymentStatus.status === 'paid') {
+
+        if (paymentStatus.status === "paid") {
           console.log(`✅ Найден оплаченный инвойс: ${invoiceId}`);
-          
-          // Обрабатываем успешный платеж и создаем задачу в Notion
           await processSuccessfulPayment(invoiceId, paymentData);
-          processed++;
-          
-        } else if (paymentStatus.status === 'expired' || paymentData.attempts > 12) {
-          // Удаляем просроченные или слишком старые платежи (12 попыток = 6 минут)
-          console.log(`🗑️ Удаляем инвойс ${invoiceId} (статус: ${paymentStatus.status}, попытки: ${paymentData.attempts})`);
+        } else if (
+          paymentStatus.status === "expired" ||
+          paymentData.attempts > 12
+        ) {
           removePendingPayment(invoiceId);
         }
-
       } catch (error) {
         console.error(`❌ Ошибка проверки инвойса ${invoiceId}:`, error);
-        errors++;
       }
     }
-
-    if (processed > 0 || errors > 0) {
-      console.log(`📊 Результаты проверки платежей: обработано ${processed}, ошибок ${errors}`);
-    }
-
   } catch (error) {
-    console.error('❌ Критическая ошибка в checkPendingPayments:', error);
+    console.error("❌ Критическая ошибка в checkPendingPayments:", error);
   }
 }
 
-// Функция обработки успешного платежа и создания задачи в Notion
-async function processSuccessfulPayment(invoiceId, paymentData) {
+async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) {
+  const maxRetries = 3;
+  
   try {
     const { order, invoiceAmount, userId, chatId } = paymentData;
-    
-    // Получаем названия локализаций
-    const getLocalizations = localization();
-    const localizationNames = order.selectedLocalizations
-      .map(id => getLocalizations.find(loc => loc.id === id)?.name)
-      .filter(Boolean);
 
-    console.log(`📤 Создание задачи в Notion для инвойса ${invoiceId}, заказ #${order.orderNumber}`);
+    console.log(`📤 Создание задачи в Notion для инвойса ${invoiceId}, попытка ${retryCount + 1}`);
 
-    // СОЗДАЕМ ЗАДАЧУ В NOTION ПОСЛЕ ОПЛАТЫ
     const notionTask = await createNotionTask({
       orderNumber: order.orderNumber,
       userId: userId,
       adaptationsCount: order.adaptationsCount,
-      localizations: localizationNames,
+      adaptations: order.adaptations,
       bank: order.bank,
       winningAmount: order.winningAmount,
-      currency: order.currency,
       additionalInfo: order.additionalInfo,
-      paymentStatus: 'paid',
-      invoiceId: invoiceId
+      paymentStatus: "paid",
+      invoiceId: invoiceId,
     });
 
     if (notionTask && notionTask.id) {
-      console.log(`✅ Задача создана в Notion: ${notionTask.id} для заказа #${order.orderNumber}`);
-      
-      // Отправляем уведомление пользователю
-      try {
-        await bot.telegram.sendMessage(
-          chatId,
-          `🎉 *Оплата подтверждена!*\n\n` +
-          `✅ Заказ #${order.orderNumber} успешно создан и передан в работу.\n` +
+      await bot.telegram.sendMessage(
+        chatId,
+        `🎉 *Оплата подтверждена!*\n\n` +
+          `✅ Заказ #${order.orderNumber} успешно создан.\n` +
           `💰 Сумма оплаты: ${invoiceAmount} USDT\n` +
           `📋 ID транзакции: ${invoiceId}\n` +
           `🔗 ID в Notion: ${notionTask.id}\n\n` +
           `Мы уведомим вас когда адаптация будет готова.`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (msgError) {
-        console.error('❌ Не удалось отправить сообщение пользователю:', msgError);
-      }
+        { parse_mode: "Markdown" }
+      );
 
-      // Удаляем из pending
       removePendingPayment(invoiceId);
-      
+      console.log(`✅ Successfully processed payment ${invoiceId}`);
     } else {
-      throw new Error('Не удалось создать задачу в Notion');
+      throw new Error("Не удалось создать задачу в Notion");
     }
 
   } catch (error) {
-    console.error(`❌ Ошибка обработки успешного платежа ${invoiceId}:`, error);
+    console.error(`❌ Ошибка обработки платежа ${invoiceId}:`, error);
     
-    // Уведомляем админа о критической ошибке
-    try {
-      if (config.ADMIN_CHAT_ID) {
+    if (retryCount < maxRetries) {
+      console.log(`🔄 Retrying payment processing for ${invoiceId}, attempt ${retryCount + 1}`);
+      // Ждем перед повторной попыткой
+      await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1)));
+      return processSuccessfulPayment(invoiceId, paymentData, retryCount + 1);
+    } else {
+      // После всех неудачных попыток
+      console.error(`🚨 Failed to process payment ${invoiceId} after ${maxRetries} attempts`);
+      
+      try {
         await bot.telegram.sendMessage(
-          config.ADMIN_CHAT_ID,
-          `🚨 КРИТИЧЕСКАЯ ОШИБКА: Не удалось создать задачу в Notion после оплаты\n\n` +
-          `Инвойс: ${invoiceId}\n` +
-          `Заказ: ${paymentData.order.orderNumber}\n` +
-          `Ошибка: ${error.message}`
+          paymentData.chatId,
+          `❌ *Внимание!*\n\n` +
+            `Оплата по счету #${invoiceId} получена, но возникла ошибка при создании заказа.\n\n` +
+            `⚠️ Пожалуйста, свяжитесь с поддержкой и предоставьте:\n` +
+            `• ID транзакции: ${invoiceId}\n` +
+            `• Номер заказа: ${paymentData.order.orderNumber}\n\n` +
+            `Мы решим проблему вручную в ближайшее время.`,
+          { parse_mode: "Markdown" }
         );
+      } catch (notificationError) {
+        console.error('❌ Failed to send error notification:', notificationError);
       }
-    } catch (adminError) {
-      console.error('❌ Не удалось уведомить админа:', adminError);
     }
   }
 }
 
-// Запуск автоматической проверки платежей
-function startPaymentChecking() {
-  if (paymentCheckInterval) {
-    clearInterval(paymentCheckInterval);
+async function handleOrphanedPayment(ctx, invoiceId, paymentStatus) {
+  try {
+    console.log(`🔄 Handling orphaned payment: ${invoiceId}`);
+    
+    // Пытаемся восстановить данные заказа из истории или создать новую задачу
+    await ctx.editMessageText(
+      "✅ Оплата подтверждена!\n\n" +
+      "🔍 Создаем задачу в системе...\n\n" +
+      "Пожалуйста, подождите..."
+    );
+
+    // Здесь можно добавить логику восстановления данных заказа
+    // Например, из логов или базы данных
+    
+    // Временное решение - просим пользователя ввести данные заново
+    await ctx.reply(
+      "🎉 Оплата подтверждена!\n\n" +
+      "К сожалению, данные заказа были утеряны.\n\n" +
+      "Пожалуйста, введите номер вашего заказа для создания задачи:"
+    );
+    
+    // Устанавливаем специальный шаг для восстановления
+    ctx.session.step = "recovering_order_after_payment";
+    ctx.session.paidInvoiceId = invoiceId;
+    
+  } catch (error) {
+    console.error(`❌ Error handling orphaned payment ${invoiceId}:`, error);
+    
+    await ctx.reply(
+      "✅ Оплата подтверждена, но возникла ошибка при создании заказа.\n\n" +
+      "Пожалуйста, свяжитесь с поддержкой и предоставьте этот ID:\n" +
+      `📋 Invoice ID: ${invoiceId}\n\n` +
+      "Мы решим проблему в ближайшее время."
+    );
   }
-
-  paymentCheckInterval = setInterval(checkPendingPayments, 10000); // Каждые 10 секунд
-
-  console.log('✅ Автоматическая проверка платежей запущена (каждые 10 секунд)');
 }
 
-// Остановка автоматической проверки платежей
+function startPaymentChecking() {
+  if (global.paymentCheckInterval) {
+    clearInterval(global.paymentCheckInterval);
+  }
+
+  global.paymentCheckInterval = setInterval(() => {
+    activityManager.recordActivity();
+    checkPendingPayments();
+  }, 10000);
+
+  console.log("✅ Автоматическая проверка платежей запущена");
+}
+
 function stopPaymentChecking() {
-  if (paymentCheckInterval) {
-    clearInterval(paymentCheckInterval);
-    paymentCheckInterval = null;
-    console.log('🛑 Автоматическая проверка платежей остановлена');
+  if (global.paymentCheckInterval) {
+    clearInterval(global.paymentCheckInterval);
+    global.paymentCheckInterval = null;
+    console.log("🛑 Автоматическая проверка платежей остановлена");
   }
 }
 
 // ========== ОСНОВНЫЕ ФУНКЦИИ ==========
 
-// Функция для запуска автоматической проверки заказов
 function startAutoChecking(minutes = 15) {
-  if (autoCheckInterval) {
-    clearInterval(autoCheckInterval);
+  if (global.autoCheckInterval) {
+    clearInterval(global.autoCheckInterval);
   }
 
   const intervalMs = minutes * 60 * 1000;
-  
-  autoCheckInterval = setInterval(async () => {
+
+  global.autoCheckInterval = setInterval(async () => {
+    activityManager.recordActivity();
     try {
-      console.log(`🔄 Автоматическая проверка заказов... (${new Date().toLocaleString()})`);
-      
+      console.log(`🔄 Автоматическая проверка заказов...`);
       const result = await processAndSendLinks(bot);
-      
-      console.log(`📊 Результаты автоматической проверки: отправлено ${result.sent}, ошибок: ${result.errors}`);
-      
-      if (result.sent > 0) {
-        console.log(`✅ Автоматически отправлено ${result.sent} ссылок`);
-      }
-      
+      console.log(
+        `📊 Результаты: отправлено ${result.sent}, ошибок: ${result.errors}`
+      );
     } catch (error) {
-      console.error('❌ Ошибка при автоматической проверке заказов:', error);
+      console.error("❌ Ошибка при автоматической проверке заказов:", error);
     }
   }, intervalMs);
 
-  console.log(`✅ Автоматическая проверка заказов запущена (каждые ${minutes} минут)`);
+  console.log(`✅ Автоматическая проверка заказов запущена`);
 }
 
-// Функция для остановки автоматической проверки
 function stopAutoChecking() {
-  if (autoCheckInterval) {
-    clearInterval(autoCheckInterval);
-    autoCheckInterval = null;
-    console.log('🛑 Автоматическая проверка заказов остановлена');
+  if (global.autoCheckInterval) {
+    clearInterval(global.autoCheckInterval);
+    global.autoCheckInterval = null;
+    console.log("🛑 Автоматическая проверка заказов остановлена");
   }
 }
 
-// Функция для тестовой отправки задачи в Notion
-// async function sendTestTaskToNotion(ctx) {
-//   try {
-//     await ctx.reply('🧪 Создаю тестовую задачу в Notion...');
-    
-//     const testTaskData = {
-//       orderNumber: 565447854123654,
-//       userId: 465065447,
-//       adaptationsCount: 2,
-//       localizations: ['🇺🇸 EN (английский)', '🇷🇺 RU (русский)'],
-//       bank: 'Test Bank',
-//       winningAmount: 1000,
-//       currency: 'USD',
-//       additionalInfo: 'Тестовая задача создана через бота',
-//       paymentStatus: 'paid',
-//       invoiceId: `test_invoice_${Date.now()}`
-//     };
-    
-//     const notionTask = await createNotionTask(testTaskData);
-    
-//     if (notionTask && notionTask.id) {
-//       await ctx.reply(
-//         `✅ *Тестовая задача успешно создана!*\n\n` +
-//         `📋 Номер заказа: ${testTaskData.orderNumber}\n` +
-//         `🎬 Адаптаций: ${testTaskData.adaptationsCount}\n` +
-//         `🌍 Локализации: ${testTaskData.localizations.join(', ')}\n` +
-//         `🏦 Банк: ${testTaskData.bank}\n` +
-//         `💰 Сумма: ${testTaskData.winningAmount} ${testTaskData.currency}\n` +
-//         `📝 Доп. информация: ${testTaskData.additionalInfo}\n\n` +
-//         `🔗 ID в Notion: ${notionTask.id}`,
-//         { parse_mode: 'Markdown' }
-//       );
-      
-//       console.log(`✅ Test task created in Notion: ${notionTask.id}`);
-//     } else {
-//       throw new Error('Не удалось создать задачу в Notion');
-//     }
-    
-//   } catch (error) {
-//     console.error('❌ Error creating test task in Notion:', error);
-//     await ctx.reply(
-//       `❌ Ошибка при создании тестовой задачи:\n${error.message}`
-//     );
-//   }
-// }
+// Делаем функции глобальными
+global.stopPaymentChecking = stopPaymentChecking;
+global.startPaymentChecking = startPaymentChecking;
+global.stopAutoChecking = stopAutoChecking;
+global.startAutoChecking = startAutoChecking;
 
 // Функция для получения списка локализаций
 const getLocalizations = localization();
 
-// Функция для создания клавиатуры валют
 function createCurrencyKeyboard() {
-const currencies = currency
-  
-  const buttons = currencies.map(currency => 
+  const currencies = currency;
+  const buttons = currencies.map((currency) =>
     Markup.button.callback(currency.name, `currency_${currency.code}`)
   );
-  
-  // Разбиваем на строки по 2 кнопки
+
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) {
     rows.push(buttons.slice(i, i + 2));
   }
-  
+
   return Markup.inlineKeyboard(rows);
 }
 
-// Функция для создания клавиатуры локализаций
-function createLocalizationsKeyboard(selectedIds = []) {
-  const buttons = getLocalizations.map(loc => {
-    const isSelected = selectedIds.includes(loc.id);
-    const prefix = isSelected ? '✅ ' : '';
-    return Markup.button.callback(
-      `${prefix}${loc.name}`,
-      `localization_${loc.id}`
-    );
-  });
-  
-  // Разбиваем на строки по 2 кнопки
+function createLocalizationsKeyboard() {
+  const buttons = getLocalizations.map((loc) =>
+    Markup.button.callback(loc.name, `localization_${loc.id}`)
+  );
+
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) {
     rows.push(buttons.slice(i, i + 2));
   }
-  
+
   return rows;
 }
 
-
-// Функция для расчета стоимости заказа
 function calculateOrderPrice(order) {
-  const pricePerAdaptation = config.PRICES.ADAPTATION; // цена за адаптацию
+  const pricePerAdaptation = config.PRICES.ADAPTATION;
   const adaptationsPrice = order.adaptationsCount * pricePerAdaptation;
-  
-  return {
-    adaptationsPrice,
-  };
+  return { adaptationsPrice };
 }
 
-// Функция для создания инвойса через CryptoBot
 async function createInvoice(ctx) {
   try {
     const order = ctx.session.order;
     const userId = ctx.from.id;
     const chatId = ctx.chat.id;
-    
-    // Рассчитываем сумму
+
     const priceInfo = calculateOrderPrice(order);
     const amount = priceInfo.adaptationsPrice * 1.03;
-    
-    // Создаем описание заказа
     const description = `Заказ #${order.orderNumber} - ${order.adaptationsCount} адаптаций`;
-    
-    console.log(`💰 Creating invoice for user ${userId}: order ${order.orderNumber}, amount: ${amount} USD`);
-    
-    // Создаем инвойс через CryptoBot
-    const invoice = await cryptoBot.createInvoice(amount, description, order.orderNumber);
-    
-    // Сохраняем информацию об инвойсе в сессии
+
+    console.log(
+      `💰 Creating invoice for order ${order.orderNumber}, amount: ${amount} USD`
+    );
+
+    const invoice = await cryptoBot.createInvoice(
+      amount,
+      description,
+      order.orderNumber
+    );
+
     ctx.session.invoiceId = invoice.invoice_id;
     ctx.session.invoiceAmount = amount;
     ctx.session.payUrl = invoice.pay_url;
-    
+
     console.log(`✅ Invoice created: ${invoice.invoice_id}`);
-    
-    // СОХРАНЯЕМ В PENDING ПЛАТЕЖИ ДЛЯ АВТОМАТИЧЕСКОЙ ПРОВЕРКИ
+
     savePendingPayment(invoice.invoice_id, {
       order: { ...order },
       invoiceAmount: amount,
       payUrl: invoice.pay_url,
       userId: userId,
-      chatId: chatId
+      chatId: chatId,
     });
-    
-    // Показываем пользователю информацию об оплате
+
     await ctx.reply(
       `💳 *Счет на оплату*\n\n` +
-      `📋 Номер заказа: #${order.orderNumber}\n` +
-      `🎬 Адаптаций: ${order.adaptationsCount}\n` +
-      `💵 Сумма к оплате: ${amount} USDT\n\n` +
-      `⏳ Счет действителен в течение 15 минут\n` +
-      `🤖 Статус оплаты проверяется автоматически\n\n` +
-      `Для оплаты перейдите по ссылке ниже:`,
+        `📋 Номер заказа: #${order.orderNumber}\n` +
+        `🎬 Адаптаций: ${order.adaptationsCount}\n` +
+        `💵 Сумма к оплате: ${amount} USDT\n\n` +
+        `⏳ Счет действителен в течение 15 минут\n` +
+        `🤖 Статус оплаты проверяется автоматически\n\n` +
+        `Для оплаты перейдите по ссылке ниже:`,
       {
-        parse_mode: 'Markdown',
+        parse_mode: "Markdown",
         ...Markup.inlineKeyboard([
-          [Markup.button.url('💳 Оплатить криптовалютой', invoice.pay_url)],
-          [Markup.button.callback('🔍 Проверить оплату', 'check_payment')],
-          [Markup.button.callback('❌ Отменить', 'cancel_payment')]
-        ])
+          [Markup.button.url("💳 Оплатить криптовалютой", invoice.pay_url)],
+          [Markup.button.callback("🔍 Проверить оплату", "check_payment")],
+          [Markup.button.callback("❌ Отменить", "cancel_payment")],
+        ]),
       }
     );
-    
   } catch (error) {
-    console.error('❌ Error creating invoice:', error);
+    console.error("❌ Error creating invoice:", error);
     await ctx.reply(
-      '❌ Произошла ошибка при создании счета. Пожалуйста, попробуйте еще раз или обратитесь в поддержку.'
+      "❌ Произошла ошибка при создании счета. Пожалуйста, попробуйте еще раз."
     );
   }
 }
 
 // ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 
+// Мидлварь для отслеживания активности
+bot.use((ctx, next) => {
+  activityManager.recordActivity();
+  return next();
+});
+
 // Обработчик команды /start
 bot.start(async (ctx) => {
-  console.log('👤 User started:', ctx.from.id);
-  
+  activityManager.recordActivity();
+  console.log("👤 User started:", ctx.from.id);
+
   // Инициализируем сессию
   ctx.session = {
-    step: 'awaiting_order_number',
+    step: "awaiting_order_number",
     order: {
-      selectedLocalizations: []
-    }
+      adaptations: [],
+    },
   };
-  
+
   await ctx.reply(
     `👋 Добро пожаловать! Я помогу оформить заказ и оплатить его криптовалютой.\n\n` +
-    `📋 Для начала введите номер вашего заказа:`
+      `📋 Для начала введите номер вашего заказа:\n\n`
   );
 });
 
-// Обработка текстовых сообщений (для основного потока заказа)
-bot.on('text', async (ctx) => {
+// Обработка текстовых сообщений
+bot.on("text", async (ctx) => {
+  activityManager.recordActivity();
+
   // Пропускаем команды
-  if (ctx.message.text.startsWith('/')) {
+  if (ctx.message.text.startsWith("/")) {
     return;
   }
 
-  if (ctx.session?.step === 'awaiting_order_number') {
+  console.log("📝 Received text:", ctx.message.text);
+  console.log("🔍 Current step:", ctx.session?.step);
+
+  if (ctx.session?.step === "awaiting_order_number") {
     const orderNumber = ctx.message.text.trim();
-    
+
     if (!/^\d+$/.test(orderNumber)) {
-      await ctx.reply('❌ Пожалуйста, введите корректный номер заказа (только цифры):');
+      await ctx.reply(
+        "❌ Пожалуйста, введите корректный номер заказа (только цифры):"
+      );
       return;
     }
-    
+
     ctx.session.order.orderNumber = orderNumber;
-    ctx.session.step = 'selecting_adaptations';
-    
-    console.log(`📝 User ${ctx.from.id} entered order number: ${orderNumber}`);
-    
+    ctx.session.step = "selecting_adaptations";
+
+    console.log(`✅ User ${ctx.from.id} entered order number: ${orderNumber}`);
+
     await ctx.reply(
       `✅ Номер заказа: ${orderNumber}\n\n` +
-      `🎬 Теперь выберите количество адаптаций:`,
+        `🎬 Теперь выберите количество адаптаций:`,
       Markup.inlineKeyboard([
         [
-          Markup.button.callback('1', 'adaptations_1'),
-          Markup.button.callback('2', 'adaptations_2'),
-          Markup.button.callback('3', 'adaptations_3')
+          Markup.button.callback("1", "adaptations_1"),
+          Markup.button.callback("2", "adaptations_2"),
+          Markup.button.callback("3", "adaptations_3"),
         ],
         [
-          Markup.button.callback('4', 'adaptations_4'),
-          Markup.button.callback('5', 'adaptations_5'),
-          Markup.button.callback('6', 'adaptations_6')
-        ]
+          Markup.button.callback("4", "adaptations_4"),
+          Markup.button.callback("5", "adaptations_5"),
+          Markup.button.callback("6", "adaptations_6"),
+        ],
       ])
     );
     return;
   }
-  
-  // Обработка ввода банка
-  if (ctx.session?.step === 'entering_bank') {
+
+  if (ctx.session?.step === "entering_bank") {
     const bank = ctx.message.text.trim();
-    
+
     if (bank.length === 0) {
-      await ctx.reply('❌ Пожалуйста, введите название банка:');
+      await ctx.reply("❌ Пожалуйста, введите название банка:");
       return;
     }
-    
+
     ctx.session.order.bank = bank;
-    ctx.session.step = 'entering_winning_amount';
-    
-    console.log(`🏦 User ${ctx.from.id} entered bank: ${bank}`);
-    
+    ctx.session.step = "entering_winning_amount";
+
+    console.log(`🏦 User entered bank: ${bank}`);
+
     await ctx.reply(
       `✅ Банк: ${bank}\n\n` +
-      `💰 Теперь укажите сумму выигрыша (только цифры):`
+        `💰 Теперь укажите сумму выигрыша (только цифры):`
     );
     return;
   }
-  
-  // Обработка ввода суммы выигрыша
-  if (ctx.session?.step === 'entering_winning_amount') {
+
+  if (ctx.session?.step === "entering_winning_amount") {
     const winningAmount = parseFloat(ctx.message.text.trim());
-    
+
     if (isNaN(winningAmount) || winningAmount <= 0) {
-      await ctx.reply('❌ Пожалуйста, введите корректную сумму выигрыша (только цифры, больше 0):');
+      await ctx.reply(
+        "❌ Пожалуйста, введите корректную сумму выигрыша (только цифры, больше 0):"
+      );
       return;
     }
-    
+
     ctx.session.order.winningAmount = winningAmount;
-    ctx.session.step = 'selecting_currency';
-    
-    console.log(`💰 User ${ctx.from.id} entered winning amount: ${winningAmount}`);
-    
+    ctx.session.step = "entering_additional_info";
+
+    console.log(`💰 User entered winning amount: ${winningAmount}`);
+
     await ctx.reply(
       `✅ Сумма выигрыша: ${winningAmount}\n\n` +
-      `💱 Теперь выберите валюту:`,
-      createCurrencyKeyboard()
+        `📝 Теперь укажите дополнительную информацию (или напишите "нет", если не требуется):`
     );
     return;
   }
-  
-  // Обработка ввода дополнительной информации
-  if (ctx.session?.step === 'entering_additional_info') {
+
+  if (ctx.session?.step === "entering_additional_info") {
     const additionalInfo = ctx.message.text.trim();
-    
     ctx.session.order.additionalInfo = additionalInfo;
-    
-    console.log(`📝 User ${ctx.from.id} entered additional info: ${additionalInfo}`);
-    
-    // Создаем инвойс
+
+    console.log(`📝 User entered additional info: ${additionalInfo}`);
+
     await createInvoice(ctx);
     return;
   }
 });
 
-// Обработка выбора валюты
-bot.action(/currency_(.+)/, async (ctx) => {
-  const currencyCode = ctx.match[1];
-  
-  ctx.session.order.currency = currencyCode;
-  ctx.session.step = 'entering_additional_info';
-  
-  console.log(`💱 User ${ctx.from.id} selected currency: ${currencyCode}`);
-  
-  await ctx.editMessageText(
-    `✅ Валюта: ${currencyCode}\n\n` +
-    `📝 Теперь укажите дополнительную информацию (или напишите "нет", если не требуется):`
-  );
-  
-  await ctx.answerCbQuery();
-});
-
-// Обработка выбора количества адаптаций
+// Обработчики callback запросов
 bot.action(/adaptations_(\d+)/, async (ctx) => {
   const adaptationsCount = parseInt(ctx.match[1]);
-  
+
   ctx.session.order.adaptationsCount = adaptationsCount;
-  ctx.session.step = 'selecting_localizations';
-  
-  console.log(`🎬 User ${ctx.from.id} selected ${adaptationsCount} adaptations`);
-  
-  const keyboardRows = createLocalizationsKeyboard([]);
-  
-  if (adaptationsCount > 1) {
-    keyboardRows.push([
-      Markup.button.callback('✅ Завершить выбор', 'finish_localization')
-    ]);
-  }
-  
+  ctx.session.order.adaptations = [];
+  ctx.session.currentAdaptation = 1;
+  ctx.session.step = "selecting_localization_for_adaptation";
+
+  console.log(`🎬 User selected ${adaptationsCount} adaptations`);
+
   await ctx.editMessageText(
     `🎬 Количество адаптаций: ${adaptationsCount}\n\n` +
-    `🌍 Выберите ${adaptationsCount === 1 ? 'одну локализацию' : 'локализации'}:\n` +
-    `✅ Выбрано: 0 из ${adaptationsCount}`,
-    Markup.inlineKeyboard(keyboardRows)
+      `🌍 Выберите геолокацию для адаптации #1:`,
+    Markup.inlineKeyboard(createLocalizationsKeyboard())
   );
-  
+
   await ctx.answerCbQuery();
 });
 
-// Обработка выбора локализации
 bot.action(/localization_(\d+)/, async (ctx) => {
   const localizationId = parseInt(ctx.match[1]);
-  const order = ctx.session.order;
-  
-  const selectedLocalization = getLocalizations.find(loc => loc.id === localizationId);
-  
+  const currentAdaptation = ctx.session.currentAdaptation;
+  const adaptationsCount = ctx.session.order.adaptationsCount;
+
+  const selectedLocalization = getLocalizations.find(
+    (loc) => loc.id === localizationId
+  );
+
   if (!selectedLocalization) {
-    await ctx.answerCbQuery('❌ Локализация не найдена');
+    await ctx.answerCbQuery("❌ Локализация не найдена");
     return;
   }
-  
-  if (order.adaptationsCount === 1) {
-    order.selectedLocalizations = [localizationId];
-    
+
+  ctx.session.order.adaptations[currentAdaptation - 1] = {
+    localization: selectedLocalization.name,
+    localizationId: localizationId,
+  };
+
+  console.log(`🌍 User selected localization: ${selectedLocalization.name}`);
+
+  ctx.session.step = "selecting_currency_for_adaptation";
+
+  await ctx.editMessageText(
+    `✅ Адаптация #${currentAdaptation}: ${selectedLocalization.name}\n\n` +
+      `💱 Теперь выберите валюту для адаптации #${currentAdaptation}:`,
+    createCurrencyKeyboard()
+  );
+
+  await ctx.answerCbQuery();
+});
+
+bot.action(/currency_(.+)/, async (ctx) => {
+  const currencyCode = ctx.match[1];
+  const currentAdaptation = ctx.session.currentAdaptation;
+  const adaptationsCount = ctx.session.order.adaptationsCount;
+
+  if (ctx.session.order.adaptations[currentAdaptation - 1]) {
+    ctx.session.order.adaptations[currentAdaptation - 1].currency =
+      currencyCode;
+  }
+
+  console.log(`💱 User selected currency: ${currencyCode}`);
+
+  if (currentAdaptation < adaptationsCount) {
+    ctx.session.currentAdaptation = currentAdaptation + 1;
+    ctx.session.step = "selecting_localization_for_adaptation";
+
     await ctx.editMessageText(
-      `✅ Вы выбрали: ${selectedLocalization.name}\n\n` +
-      `🏦 Теперь укажите название банка:`
+      `✅ Адаптация #${currentAdaptation} завершена!\n\n` +
+        `🌍 Теперь выберите геолокацию для адаптации #${
+          currentAdaptation + 1
+        }:`,
+      Markup.inlineKeyboard(createLocalizationsKeyboard())
     );
-    
-    ctx.session.step = 'entering_bank';
-    await ctx.answerCbQuery();
-    return;
-  }
-  
-  const index = order.selectedLocalizations.indexOf(localizationId);
-  
-  if (index > -1) {
-    order.selectedLocalizations.splice(index, 1);
   } else {
-    if (order.selectedLocalizations.length >= order.adaptationsCount) {
-      await ctx.answerCbQuery(`❌ Можно выбрать максимум ${order.adaptationsCount} локализаций`);
+    ctx.session.step = "entering_bank";
+
+    const adaptationsSummary = ctx.session.order.adaptations
+      .map(
+        (adapt, index) =>
+          `Адаптация #${index + 1}: ${adapt.localization} (${adapt.currency})`
+      )
+      .join("\n");
+
+    await ctx.editMessageText(
+      `🎉 Все адаптации настроены!\n\n` +
+        `${adaptationsSummary}\n\n` +
+        `🏦 Теперь укажите название банка:`
+    );
+  }
+
+  await ctx.answerCbQuery();
+});
+
+// УЛУЧШЕННЫЙ ОБРАБОТЧИК ПРОВЕРКИ ОПЛАТЫ
+bot.action("check_payment", async (ctx) => {
+  debugSession(ctx); // Отладочная информация
+  
+  await ctx.answerCbQuery("🔍 Проверяем оплату...");
+
+  try {
+    // Пытаемся получить invoiceId из разных источников
+    let invoiceId = ctx.session?.invoiceId;
+    
+    // Если в сессии нет, ищем в pendingPayments по userId
+    if (!invoiceId) {
+      console.log(`🔍 InvoiceId not found in session, searching in pending payments for user: ${ctx.from.id}`);
+      
+      for (const [invId, paymentData] of pendingPayments.entries()) {
+        if (paymentData.userId === ctx.from.id) {
+          invoiceId = invId;
+          console.log(`✅ Found invoiceId in pending payments: ${invoiceId}`);
+          
+          // Обновляем сессию
+          if (ctx.session) {
+            ctx.session.invoiceId = invoiceId;
+            ctx.session.payUrl = paymentData.payUrl;
+          }
+          break;
+        }
+      }
+    }
+
+    if (!invoiceId) {
+      await ctx.editMessageText(
+        "❌ Информация о счете не найдена.\n\n" +
+        "Возможные причины:\n" +
+        "• Сессия была сброшена\n" +
+        "• Счет был отменен или просрочен\n\n" +
+        "Пожалуйста, начните заново с команды /start"
+      );
       return;
     }
-    order.selectedLocalizations.push(localizationId);
-  }
-  
-  const selectedCount = order.selectedLocalizations.length;
-  const keyboardRows = createLocalizationsKeyboard(order.selectedLocalizations);
-  
-  keyboardRows.push([
-    Markup.button.callback(
-      selectedCount > 0 ? '✅ Завершить выбор' : '⚠️ Выберите локализации', 
-      'finish_localization'
-    )
-  ]);
-  
-  await ctx.editMessageText(
-    `🎬 Количество адаптаций: ${order.adaptationsCount}\n\n` +
-    `🌍 Выберите локализации:\n` +
-    `✅ Выбрано: ${selectedCount} из ${order.adaptationsCount}`,
-    Markup.inlineKeyboard(keyboardRows)
-  );
-  
-  await ctx.answerCbQuery();
-});
 
-// Завершение выбора локализаций
-bot.action('finish_localization', async (ctx) => {
-  const order = ctx.session.order;
-  
-  if (order.selectedLocalizations.length === 0) {
-    await ctx.answerCbQuery('❌ Выберите хотя бы одну локализацию');
-    return;
-  }
-  
-  const selectedNames = order.selectedLocalizations
-    .map(id => getLocalizations.find(loc => loc.id === id)?.name)
-    .filter(Boolean)
-    .join(', ');
-  
-  ctx.session.step = 'entering_bank';
-  
-  await ctx.editMessageText(
-    `🎉 Отлично! Вы выбрали ${order.adaptationsCount} адаптаций для локализаций:\n${selectedNames}\n\n` +
-    `🏦 Теперь укажите название банка:`
-  );
-  
-  await ctx.answerCbQuery();
-});
+    await ctx.editMessageText("🔍 Проверяем статус оплаты...");
 
-// Проверка оплаты (ручная)
-bot.action('check_payment', async (ctx) => {
-  await ctx.answerCbQuery('🔍 Проверяем оплату...');
-  
-  const invoiceId = ctx.session.invoiceId;
-  
-  if (!invoiceId) {
-    await ctx.reply('❌ Информация о счете не найдена');
-    return;
-  }
-  
-  await ctx.editMessageText('🔍 Проверяем статус оплаты... Дождетесь оплаты и не делайте следующий заказ, для корректной обработки заказа');
-  
-  try {
     const paymentStatus = await cryptoBot.checkPaymentStatus(invoiceId);
-    
-    if (paymentStatus.status === 'paid') {
-      // Если оплачено, запускаем обработку
+    console.log(`📊 Payment status for ${invoiceId}:`, paymentStatus);
+
+    if (paymentStatus.status === "paid") {
+      console.log(`✅ Payment confirmed for invoice: ${invoiceId}`);
+      
       const pendingData = getPendingPayment(invoiceId);
       if (pendingData) {
         await processSuccessfulPayment(invoiceId, pendingData);
       } else {
-        await ctx.editMessageText('✅ Оплата подтверждена! Обрабатываем заказ...');
-        // Если нет в pending, но оплачено, создаем задачу
-        await completePayment(ctx);
+        // Если платеж есть в CryptoBot, но нет в pendingPayments
+        await handleOrphanedPayment(ctx, invoiceId, paymentStatus);
       }
     } else {
       await ctx.editMessageText(
         `❌ Оплата еще не поступила.\n\n` +
-        `Статус: ${paymentStatus.status}\n\n` +
-        `Пожалуйста, перейдите по ссылке для оплаты. Статус проверяется автоматически.`,
+        `Статус: ${paymentStatus.status}\n` +
+        `💡 Совет: Иногда платежи обрабатываются до 15 минут\n\n` +
+        `Пожалуйста, перейдите по ссылке для оплаты или проверьте позже.`,
         Markup.inlineKeyboard([
-          [Markup.button.url('💳 Оплатить', ctx.session.payUrl)],
-          [Markup.button.callback('🔄 Проверить еще раз', 'check_payment')],
-          [Markup.button.callback('❌ Отменить', 'cancel_payment')]
+          [Markup.button.url("💳 Оплатить", ctx.session.payUrl || "https://t.me/your_bot")],
+          [Markup.button.callback("🔄 Проверить еще раз", "check_payment")],
+          [Markup.button.callback("🆘 Помощь", "payment_help")],
         ])
       );
     }
+
   } catch (error) {
-    console.error('❌ Error checking payment:', error);
-    await ctx.reply('❌ Произошла ошибка при проверке оплаты. Попробуйте позже.');
+    console.error("❌ Error checking payment:", error);
+    
+    await ctx.editMessageText(
+      "❌ Произошла ошибка при проверке оплаты.\n\n" +
+      "Пожалуйста, попробуйте еще раз через несколько минут.\n" +
+      "Если проблема повторяется, обратитесь в поддержку.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("🔄 Попробовать снова", "check_payment")],
+        [Markup.button.callback("🆘 Помощь", "payment_help")],
+      ])
+    );
   }
 });
 
-// Отмена оплаты
-bot.action('cancel_payment', async (ctx) => {
-  await ctx.answerCbQuery('❌ Отменяем оплату...');
+// ОБРАБОТЧИК ПОМОЩИ ПО ПЛАТЕЖАМ
+bot.action("payment_help", async (ctx) => {
+  await ctx.answerCbQuery("📞 Помощь по оплате");
   
+  await ctx.editMessageText(
+    `🆘 *Помощь по оплате*\n\n` +
+    `*Если оплата прошла, но бот не видит:*\n` +
+    `• Платежи могут обрабатываться до 15 минут\n` +
+    `• Проверьте историю транзакций в вашем кошельке\n` +
+    `• Убедитесь, что платеж отправлен на правильный адрес\n\n` +
+    `*Если возникли проблемы:*\n` +
+    `1. Попробуйте проверить еще раз через 5 минут\n` +
+    `2. Сохраните ID транзакции: ${ctx.session?.invoiceId || 'не найден'}\n` +
+    `3. Свяжитесь с поддержкой\n\n` +
+    `*Техническая поддержка:* @your_support_username`,
+    { 
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🔄 Проверить оплату", "check_payment")],
+        [Markup.button.callback("🏠 В главное меню", "main_menu")],
+      ])
+    }
+  );
+});
+
+// ГЛАВНОЕ МЕНЮ
+bot.action("main_menu", async (ctx) => {
+  await ctx.answerCbQuery("🏠 Главное меню");
+  
+  ctx.session = {
+    step: "main_menu",
+    welcomeSent: true,
+    hasInteracted: true
+  };
+  
+  await ctx.editMessageText(
+    "🏠 *Главное меню*\n\n" +
+    "Выберите действие:",
+    {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🚀 Новый заказ", "new_order")],
+        [Markup.button.callback("📋 Мои заказы", "my_orders")],
+        [Markup.button.callback("ℹ️ Помощь", "help")],
+      ])
+    }
+  );
+});
+
+// НОВЫЙ ЗАКАЗ ИЗ ГЛАВНОГО МЕНЮ
+bot.action("new_order", async (ctx) => {
+  await ctx.answerCbQuery("🚀 Новый заказ");
+  
+  ctx.session = {
+    step: "awaiting_order_number",
+    order: {
+      adaptations: []
+    }
+  };
+  
+  await ctx.editMessageText(
+    "🚀 *Новый заказ*\n\n" +
+    "Введите номер вашего заказа:",
+    { parse_mode: "Markdown" }
+  );
+});
+
+// ЗАГЛУШКИ ДЛЯ ДОПОЛНИТЕЛЬНЫХ КНОПОК
+bot.action("my_orders", async (ctx) => {
+  await ctx.answerCbQuery("📋 Загрузка заказов...");
+  await ctx.editMessageText(
+    "📋 *Мои заказы*\n\n" +
+    "Функция находится в разработке.\n\n" +
+    "Скоро здесь появится история ваших заказов.",
+    {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🏠 В главное меню", "main_menu")],
+      ])
+    }
+  );
+});
+
+bot.action("help", async (ctx) => {
+  await ctx.answerCbQuery("ℹ️ Помощь");
+  await ctx.editMessageText(
+    `ℹ️ *Помощь по боту*\n\n` +
+    `*Основные команды:*\n` +
+    `/start - Начать оформление заказа\n` +
+    `/help - Показать эту справку\n\n` +
+    `*Тестовые команды:*\n` +
+    `/test_notion - Проверка интеграции с Notion\n` +
+    `/test_simple - Простой тест\n` +
+    `/test_notion_safe - Безопасный тест\n\n` +
+    `*Процесс заказа:*\n` +
+    `1. Введите номер заказа\n` +
+    `2. Выберите количество адаптаций\n` +
+    `3. Укажите локализации и валюты\n` +
+    `4. Введите данные банка и сумму\n` +
+    `5. Оплатите счет криптовалютой\n\n` +
+    `💡 *Бот работает 24/7 и автоматически проверяет платежи!*`,
+    {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback("🏠 В главное меню", "main_menu")],
+      ])
+    }
+  );
+});
+
+bot.action("cancel_payment", async (ctx) => {
+  await ctx.answerCbQuery("❌ Отменяем оплату...");
+
   const invoiceId = ctx.session.invoiceId;
-  
-  // Удаляем из pending платежей
   if (invoiceId) {
     removePendingPayment(invoiceId);
   }
-  
-  // Очищаем сессию
-  ctx.session.step = 'completed';
+
+  ctx.session.step = "completed";
   ctx.session.order = {};
   ctx.session.invoiceId = null;
   ctx.session.payUrl = null;
-  
+  ctx.session.currentAdaptation = null;
+
   await ctx.editMessageText(
-    '❌ Оплата отменена.\n\n' +
-    'Если вы хотите начать заново, используйте команду /start'
+    "❌ Оплата отменена.\n\n" +
+      "Если вы хотите начать заново, используйте команду /start"
   );
 });
-
-// Завершение оплаты и сохранение в Notion (для обратной совместимости)
-async function completePayment(ctx) {
-  try {
-    const order = ctx.session.order;
-    const userId = ctx.from.id;
-    
-    // Получаем названия локализаций
-    const localizationNames = order.selectedLocalizations
-      .map(id => getLocalizations.find(loc => loc.id === id)?.name)
-      .filter(Boolean);
-    
-    // Сохраняем заказ в Notion
-    await ctx.editMessageText('📤 Сохраняем заказ в системе...');
-    
-    const notionTask = await createNotionTask({
-      orderNumber: order.orderNumber,
-      userId: userId,
-      adaptationsCount: order.adaptationsCount,
-      localizations: localizationNames,
-      bank: order.bank,
-      winningAmount: order.winningAmount,
-      currency: order.currency,
-      additionalInfo: order.additionalInfo,
-      paymentStatus: 'paid',
-      invoiceId: ctx.session.invoiceId
-    });
-    
-    // Успешное завершение
-    await ctx.reply(
-      `🎉 *Оплата подтверждена!*\n\n` +
-      `✅ Заказ #${order.orderNumber} успешно создан и передан в работу.\n` +
-      `💰 Сумма оплаты: ${ctx.session.invoiceAmount} USDT\n` +
-      `📋 ID транзакции: ${ctx.session.invoiceId}\n\n` +
-      `Мы уведомим вас когда адаптация будет готова.`,
-      { parse_mode: 'Markdown' }
-    );
-    
-    console.log(`✅ Order ${order.orderNumber} completed for user ${userId}`);
-    
-    // Удаляем из pending платежей
-    removePendingPayment(ctx.session.invoiceId);
-    
-    // Очищаем сессию
-    ctx.session.step = 'completed';
-    ctx.session.order = {};
-    ctx.session.invoiceId = null;
-    ctx.session.payUrl = null;
-    
-  } catch (error) {
-    console.error('❌ Error completing payment:', error);
-    await ctx.reply(
-      '❌ Произошла ошибка при сохранении заказа. Пожалуйста, обратитесь в поддержку.'
-    );
-  }
-}
-
-// ========== КОМАНДЫ АДМИНИСТРАТОРА ==========
-
-// Команда для просмотра статистики платежей
-bot.command('payment_stats', async (ctx) => {
-  // Проверяем права админа (добавьте свою логику)
-  if (ctx.from.id !== config.ADMIN_CHAT_ID) {
-    return await ctx.reply('❌ Доступ запрещен');
-  }
-  
-  const stats = {
-    totalPending: pendingPayments.size,
-    pendingList: Array.from(pendingPayments.entries()).map(([id, data]) => 
-      `• ${id}: заказ #${data.order.orderNumber}, попыток: ${data.attempts}`
-    ).join('\n')
-  };
-  
-  await ctx.reply(
-    `📊 *Статистика платежей*\n\n` +
-    `⏳ Ожидают оплаты: ${stats.totalPending}\n\n` +
-    `${stats.pendingList || 'Нет pending платежей'}`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// Теперь запускаем setupBotCommands после регистрации всех команд
-setupBotCommands(bot);
-
 
 setInterval(() => {
-  processAndSendLinks(bot)
-}, 16*60*1000);
+  processAndSendLinks(bot);
+}, 1 * 60 * 1000);
 
 // ========== ЗАПУСК БОТА ==========
 
+let phantomActivity;
+
+async function startBot() {
+  try {
+    console.log("🚀 Starting bot with enhanced features...");
+
+    // Запускаем бота
+    await bot.launch();
+    console.log("✅ Bot started successfully");
+    console.log("🤖 Bot is ready to receive commands");
+
+    // Запускаем проверки
+    startAutoChecking(15);
+    startPaymentChecking();
+
+    // Запускаем улучшенный менеджер активности
+    phantomActivity = activityManager.startEnhancedPhantomActivity();
+
+    console.log(`⏳ Мониторинг ${pendingPayments.size} pending платежей`);
+    console.log("👻 Enhanced phantom activity manager: ACTIVE");
+    console.log("👋 Welcome messages: ENABLED");
+
+    // Отправляем сообщение о успешном запуске (опционально)
+    try {
+      await bot.telegram.sendMessage(
+        config.ADMIN_CHAT_ID, // Добавьте ID админа в конфиг
+        "🤖 Бот успешно запущен!\n" +
+          `✅ Версия: Enhanced Activity + Welcome\n` +
+          `⏰ Время: ${new Date().toLocaleString("ru-RU")}\n` +
+          `🔄 Активность: Enhanced Phantom Mode`
+      );
+    } catch (adminError) {
+      console.log(
+        "ℹ️ Admin notification not sent (config.ADMIN_CHAT_ID not set)"
+      );
+    }
+  } catch (error) {
+    console.error("❌ Failed to start bot:", error);
+
+    // Попытка перезапуска через 30 секунд
+    setTimeout(() => {
+      console.log("🔄 Attempting to restart bot...");
+      startBot();
+    }, 30000);
+  }
+}
+
+// Запускаем setupBotCommands после регистрации всех команд
+setupBotCommands(bot);
+
 // Запускаем бота
-bot.launch().then(() => {
-  console.log('✅ Bot started successfully');
-  console.log('🤖 Bot is ready to receive commands');
-  console.log('💳 CryptoBot integration: ACTIVE');
-  console.log('🔍 Payment auto-check: ACTIVE');
-  
-  // Автоматически запускаем проверки при старте
-  startAutoChecking(15); // Проверка заказов каждые 15 минут
-  startPaymentChecking(); // Проверка платежей каждые 10 секунд
-  
-  console.log(`⏳ Мониторинг ${pendingPayments.size} pending платежей`);
-  
-}).catch((error) => {
-  console.error('❌ Failed to start bot:', error);
-});
+startBot();
 
+// ========== GRACEFUL SHUTDOWN ==========
 
-
-
-// Graceful shutdown
-process.once('SIGINT', () => {
-  console.log('🛑 Stopping bot...');
+process.once("SIGINT", () => {
+  console.log("🛑 Stopping bot...");
   stopAutoChecking();
   stopPaymentChecking();
-  bot.stop('SIGINT');
+  if (phantomActivity) {
+    phantomActivity.stop();
+  }
+  bot.stop("SIGINT");
 });
 
-process.once('SIGTERM', () => {
-  console.log('🛑 Stopping bot...');
+process.once("SIGTERM", () => {
+  console.log("🛑 Stopping bot...");
   stopAutoChecking();
   stopPaymentChecking();
-  bot.stop('SIGTERM');
+  if (phantomActivity) {
+    phantomActivity.stop();
+  }
+  bot.stop("SIGTERM");
+});
+
+// Обработка ошибок
+process.on("uncaughtException", (error) => {
+  console.error("🚨 UNCAUGHT EXCEPTION:", error);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🚨 UNHANDLED REJECTION at:", promise, "reason:", reason);
+});
+
+bot.catch((error, ctx) => {
+  console.error("🤖 Bot error:", error);
 });

@@ -4,6 +4,7 @@ dotenv.config();
 export default {
   TELEGRAM_BOT_TOKEN: process.env.BOT_TOKEN,
   PRICES: process.env.PRODUCT_PRICE,
+  ADMIN: process.env.ADMIN_CHAT_ID,
   
   NOTION: {
     API_KEY: process.env.NOTION_API_KEY,

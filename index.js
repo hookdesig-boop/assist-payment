@@ -8,6 +8,7 @@ import { currency } from "./src/utils/currencys.js";
 import EnhancedActivityManager from "./src/utils/active.js";
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
+
 const cryptoBot = new CryptoBotService(bot);
 const activityManager = new EnhancedActivityManager(bot);
 
@@ -24,16 +25,18 @@ global.autoCheckInterval = null;
 // ========== УТИЛИТЫ ДЛЯ ОТЛАДКИ ==========
 
 function debugSession(ctx) {
-  console.log('🔍 DEBUG SESSION:', {
+  console.log("🔍 DEBUG SESSION:", {
     userId: ctx.from?.id,
     session: ctx.session,
     invoiceId: ctx.session?.invoiceId,
     pendingPaymentsSize: pendingPayments.size,
-    pendingPayments: Array.from(pendingPayments.entries()).map(([id, data]) => ({
-      invoiceId: id,
-      userId: data.userId,
-      orderNumber: data.order?.orderNumber
-    }))
+    pendingPayments: Array.from(pendingPayments.entries()).map(
+      ([id, data]) => ({
+        invoiceId: id,
+        userId: data.userId,
+        orderNumber: data.order?.orderNumber,
+      })
+    ),
   });
 }
 
@@ -96,13 +99,21 @@ async function checkPendingPayments() {
   }
 }
 
-async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) {
+async function processSuccessfulPayment(
+  invoiceId,
+  paymentData,
+  retryCount = 0
+) {
   const maxRetries = 3;
-  
+
   try {
     const { order, invoiceAmount, userId, chatId } = paymentData;
 
-    console.log(`📤 Создание задачи в Notion для инвойса ${invoiceId}, попытка ${retryCount + 1}`);
+    console.log(
+      `📤 Создание задачи в Notion для инвойса ${invoiceId}, попытка ${
+        retryCount + 1
+      }`
+    );
 
     const notionTask = await createNotionTask({
       orderNumber: order.orderNumber,
@@ -113,7 +124,7 @@ async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) 
       winningAmount: order.winningAmount,
       additionalInfo: order.additionalInfo,
       paymentStatus: "paid",
-      invoiceId: invoiceId,
+      invoiceId: String(invoiceId), // ⬅️ ИСПРАВЛЕНО: преобразование в строку
     });
 
     if (notionTask && notionTask.id) {
@@ -133,19 +144,26 @@ async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) 
     } else {
       throw new Error("Не удалось создать задачу в Notion");
     }
-
   } catch (error) {
     console.error(`❌ Ошибка обработки платежа ${invoiceId}:`, error);
-    
+
     if (retryCount < maxRetries) {
-      console.log(`🔄 Retrying payment processing for ${invoiceId}, attempt ${retryCount + 1}`);
+      console.log(
+        `🔄 Retrying payment processing for ${invoiceId}, attempt ${
+          retryCount + 1
+        }`
+      );
       // Ждем перед повторной попыткой
-      await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1)));
+      await new Promise((resolve) =>
+        setTimeout(resolve, 2000 * (retryCount + 1))
+      );
       return processSuccessfulPayment(invoiceId, paymentData, retryCount + 1);
     } else {
       // После всех неудачных попыток
-      console.error(`🚨 Failed to process payment ${invoiceId} after ${maxRetries} attempts`);
-      
+      console.error(
+        `🚨 Failed to process payment ${invoiceId} after ${maxRetries} attempts`
+      );
+
       try {
         await bot.telegram.sendMessage(
           paymentData.chatId,
@@ -158,7 +176,10 @@ async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) 
           { parse_mode: "Markdown" }
         );
       } catch (notificationError) {
-        console.error('❌ Failed to send error notification:', notificationError);
+        console.error(
+          "❌ Failed to send error notification:",
+          notificationError
+        );
       }
     }
   }
@@ -167,36 +188,35 @@ async function processSuccessfulPayment(invoiceId, paymentData, retryCount = 0) 
 async function handleOrphanedPayment(ctx, invoiceId, paymentStatus) {
   try {
     console.log(`🔄 Handling orphaned payment: ${invoiceId}`);
-    
+
     // Пытаемся восстановить данные заказа из истории или создать новую задачу
     await ctx.editMessageText(
       "✅ Оплата подтверждена!\n\n" +
-      "🔍 Создаем задачу в системе...\n\n" +
-      "Пожалуйста, подождите..."
+        "🔍 Создаем задачу в системе...\n\n" +
+        "Пожалуйста, подождите..."
     );
 
     // Здесь можно добавить логику восстановления данных заказа
     // Например, из логов или базы данных
-    
+
     // Временное решение - просим пользователя ввести данные заново
     await ctx.reply(
       "🎉 Оплата подтверждена!\n\n" +
-      "К сожалению, данные заказа были утеряны.\n\n" +
-      "Пожалуйста, введите номер вашего заказа для создания задачи:"
+        "К сожалению, данные заказа были утеряны.\n\n" +
+        "Пожалуйста, введите номер вашего заказа для создания задачи:"
     );
-    
+
     // Устанавливаем специальный шаг для восстановления
     ctx.session.step = "recovering_order_after_payment";
     ctx.session.paidInvoiceId = invoiceId;
-    
   } catch (error) {
     console.error(`❌ Error handling orphaned payment ${invoiceId}:`, error);
-    
+
     await ctx.reply(
       "✅ Оплата подтверждена, но возникла ошибка при создании заказа.\n\n" +
-      "Пожалуйста, свяжитесь с поддержкой и предоставьте этот ID:\n" +
-      `📋 Invoice ID: ${invoiceId}\n\n` +
-      "Мы решим проблему в ближайшее время."
+        "Пожалуйста, свяжитесь с поддержкой и предоставьте этот ID:\n" +
+        `📋 Invoice ID: ${invoiceId}\n\n` +
+        "Мы решим проблему в ближайшее время."
     );
   }
 }
@@ -580,22 +600,24 @@ bot.action(/currency_(.+)/, async (ctx) => {
 // УЛУЧШЕННЫЙ ОБРАБОТЧИК ПРОВЕРКИ ОПЛАТЫ
 bot.action("check_payment", async (ctx) => {
   debugSession(ctx); // Отладочная информация
-  
+
   await ctx.answerCbQuery("🔍 Проверяем оплату...");
 
   try {
     // Пытаемся получить invoiceId из разных источников
     let invoiceId = ctx.session?.invoiceId;
-    
+
     // Если в сессии нет, ищем в pendingPayments по userId
     if (!invoiceId) {
-      console.log(`🔍 InvoiceId not found in session, searching in pending payments for user: ${ctx.from.id}`);
-      
+      console.log(
+        `🔍 InvoiceId not found in session, searching in pending payments for user: ${ctx.from.id}`
+      );
+
       for (const [invId, paymentData] of pendingPayments.entries()) {
         if (paymentData.userId === ctx.from.id) {
           invoiceId = invId;
           console.log(`✅ Found invoiceId in pending payments: ${invoiceId}`);
-          
+
           // Обновляем сессию
           if (ctx.session) {
             ctx.session.invoiceId = invoiceId;
@@ -609,10 +631,10 @@ bot.action("check_payment", async (ctx) => {
     if (!invoiceId) {
       await ctx.editMessageText(
         "❌ Информация о счете не найдена.\n\n" +
-        "Возможные причины:\n" +
-        "• Сессия была сброшена\n" +
-        "• Счет был отменен или просрочен\n\n" +
-        "Пожалуйста, начните заново с команды /start"
+          "Возможные причины:\n" +
+          "• Сессия была сброшена\n" +
+          "• Счет был отменен или просрочен\n\n" +
+          "Пожалуйста, начните заново с команды /start"
       );
       return;
     }
@@ -624,7 +646,7 @@ bot.action("check_payment", async (ctx) => {
 
     if (paymentStatus.status === "paid") {
       console.log(`✅ Payment confirmed for invoice: ${invoiceId}`);
-      
+
       const pendingData = getPendingPayment(invoiceId);
       if (pendingData) {
         await processSuccessfulPayment(invoiceId, pendingData);
@@ -635,24 +657,28 @@ bot.action("check_payment", async (ctx) => {
     } else {
       await ctx.editMessageText(
         `❌ Оплата еще не поступила.\n\n` +
-        `Статус: ${paymentStatus.status}\n` +
-        `💡 Совет: Иногда платежи обрабатываются до 15 минут\n\n` +
-        `Пожалуйста, перейдите по ссылке для оплаты или проверьте позже.`,
+          `Статус: ${paymentStatus.status}\n` +
+          `💡 Совет: Иногда платежи обрабатываются до 15 минут\n\n` +
+          `Пожалуйста, перейдите по ссылке для оплаты или проверьте позже.`,
         Markup.inlineKeyboard([
-          [Markup.button.url("💳 Оплатить", ctx.session.payUrl || "https://t.me/your_bot")],
+          [
+            Markup.button.url(
+              "💳 Оплатить",
+              ctx.session.payUrl || "https://t.me/your_bot"
+            ),
+          ],
           [Markup.button.callback("🔄 Проверить еще раз", "check_payment")],
           [Markup.button.callback("🆘 Помощь", "payment_help")],
         ])
       );
     }
-
   } catch (error) {
     console.error("❌ Error checking payment:", error);
-    
+
     await ctx.editMessageText(
       "❌ Произошла ошибка при проверке оплаты.\n\n" +
-      "Пожалуйста, попробуйте еще раз через несколько минут.\n" +
-      "Если проблема повторяется, обратитесь в поддержку.",
+        "Пожалуйста, попробуйте еще раз через несколько минут.\n" +
+        "Если проблема повторяется, обратитесь в поддержку.",
       Markup.inlineKeyboard([
         [Markup.button.callback("🔄 Попробовать снова", "check_payment")],
         [Markup.button.callback("🆘 Помощь", "payment_help")],
@@ -664,24 +690,24 @@ bot.action("check_payment", async (ctx) => {
 // ОБРАБОТЧИК ПОМОЩИ ПО ПЛАТЕЖАМ
 bot.action("payment_help", async (ctx) => {
   await ctx.answerCbQuery("📞 Помощь по оплате");
-  
+
   await ctx.editMessageText(
     `🆘 *Помощь по оплате*\n\n` +
-    `*Если оплата прошла, но бот не видит:*\n` +
-    `• Платежи могут обрабатываться до 15 минут\n` +
-    `• Проверьте историю транзакций в вашем кошельке\n` +
-    `• Убедитесь, что платеж отправлен на правильный адрес\n\n` +
-    `*Если возникли проблемы:*\n` +
-    `1. Попробуйте проверить еще раз через 5 минут\n` +
-    `2. Сохраните ID транзакции: ${ctx.session?.invoiceId || 'не найден'}\n` +
-    `3. Свяжитесь с поддержкой\n\n` +
-    `*Техническая поддержка:* @your_support_username`,
-    { 
+      `*Если оплата прошла, но бот не видит:*\n` +
+      `• Платежи могут обрабатываться до 15 минут\n` +
+      `• Проверьте историю транзакций в вашем кошельке\n` +
+      `• Убедитесь, что платеж отправлен на правильный адрес\n\n` +
+      `*Если возникли проблемы:*\n` +
+      `1. Попробуйте проверить еще раз через 5 минут\n` +
+      `2. Сохраните ID транзакции: ${ctx.session?.invoiceId || "не найден"}\n` +
+      `3. Свяжитесь с поддержкой\n\n` +
+      `*Техническая поддержка:* @your_support_username`,
+    {
       parse_mode: "Markdown",
       ...Markup.inlineKeyboard([
         [Markup.button.callback("🔄 Проверить оплату", "check_payment")],
         [Markup.button.callback("🏠 В главное меню", "main_menu")],
-      ])
+      ]),
     }
   );
 });
@@ -689,58 +715,36 @@ bot.action("payment_help", async (ctx) => {
 // ГЛАВНОЕ МЕНЮ
 bot.action("main_menu", async (ctx) => {
   await ctx.answerCbQuery("🏠 Главное меню");
-  
+
   ctx.session = {
     step: "main_menu",
     welcomeSent: true,
-    hasInteracted: true
+    hasInteracted: true,
   };
-  
-  await ctx.editMessageText(
-    "🏠 *Главное меню*\n\n" +
-    "Выберите действие:",
-    {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🚀 Новый заказ", "new_order")],
-        [Markup.button.callback("📋 Мои заказы", "my_orders")],
-        [Markup.button.callback("ℹ️ Помощь", "help")],
-      ])
-    }
-  );
+
+  await ctx.editMessageText("🏠 *Главное меню*\n\n" + "Выберите действие:", {
+    parse_mode: "Markdown",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🚀 Новый заказ", "new_order")],
+      [Markup.button.callback("ℹ️ Помощь", "help")],
+    ]),
+  });
 });
 
 // НОВЫЙ ЗАКАЗ ИЗ ГЛАВНОГО МЕНЮ
 bot.action("new_order", async (ctx) => {
   await ctx.answerCbQuery("🚀 Новый заказ");
-  
+
   ctx.session = {
     step: "awaiting_order_number",
     order: {
-      adaptations: []
-    }
+      adaptations: [],
+    },
   };
-  
-  await ctx.editMessageText(
-    "🚀 *Новый заказ*\n\n" +
-    "Введите номер вашего заказа:",
-    { parse_mode: "Markdown" }
-  );
-});
 
-// ЗАГЛУШКИ ДЛЯ ДОПОЛНИТЕЛЬНЫХ КНОПОК
-bot.action("my_orders", async (ctx) => {
-  await ctx.answerCbQuery("📋 Загрузка заказов...");
   await ctx.editMessageText(
-    "📋 *Мои заказы*\n\n" +
-    "Функция находится в разработке.\n\n" +
-    "Скоро здесь появится история ваших заказов.",
-    {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🏠 В главное меню", "main_menu")],
-      ])
-    }
+    "🚀 *Новый заказ*\n\n" + "Введите номер вашего заказа:",
+    { parse_mode: "Markdown" }
   );
 });
 
@@ -748,25 +752,21 @@ bot.action("help", async (ctx) => {
   await ctx.answerCbQuery("ℹ️ Помощь");
   await ctx.editMessageText(
     `ℹ️ *Помощь по боту*\n\n` +
-    `*Основные команды:*\n` +
-    `/start - Начать оформление заказа\n` +
-    `/help - Показать эту справку\n\n` +
-    `*Тестовые команды:*\n` +
-    `/test_notion - Проверка интеграции с Notion\n` +
-    `/test_simple - Простой тест\n` +
-    `/test_notion_safe - Безопасный тест\n\n` +
-    `*Процесс заказа:*\n` +
-    `1. Введите номер заказа\n` +
-    `2. Выберите количество адаптаций\n` +
-    `3. Укажите локализации и валюты\n` +
-    `4. Введите данные банка и сумму\n` +
-    `5. Оплатите счет криптовалютой\n\n` +
-    `💡 *Бот работает 24/7 и автоматически проверяет платежи!*`,
+      `*Основные команды:*\n` +
+      `/start - Начать оформление заказа\n` +
+      `/help - Показать эту справку\n\n` +
+      `*Процесс заказа:*\n` +
+      `1. Введите номер заказа\n` +
+      `2. Выберите количество адаптаций\n` +
+      `3. Укажите локализации и валюты\n` +
+      `4. Введите данные банка и сумму\n` +
+      `5. Оплатите счет криптовалютой\n\n` +
+      `💡 *Бот работает 24/7 и автоматически проверяет платежи!*`,
     {
       parse_mode: "Markdown",
       ...Markup.inlineKeyboard([
         [Markup.button.callback("🏠 В главное меню", "main_menu")],
-      ])
+      ]),
     }
   );
 });

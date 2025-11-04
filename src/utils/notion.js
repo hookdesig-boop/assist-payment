@@ -209,14 +209,16 @@ export async function createNotionTask(props) {
         ],
       },
       // ID инвойса
-      InvoiceID: {
-        rich_text: [
-          {
-            type: "text",
-            text: { content: invoiceId || "" },
-          },
-        ],
-      },
+         InvoiceID: {
+          rich_text: [
+            {
+              type: "text",
+              text: {
+                content: String(taskData.invoiceId), // ⬅️ Изминнения 04.11.2025
+              },
+            },
+          ],
+        },
       // Ссылка на готовое видео (пустое поле для будущего использования)
       VideoLink: {
         url: null,

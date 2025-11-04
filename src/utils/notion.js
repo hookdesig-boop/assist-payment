@@ -214,7 +214,7 @@ export async function createNotionTask(props) {
             {
               type: "text",
               text: {
-                content: String(taskData.invoiceId), // ⬅️ Изминнения 04.11.2025
+                content: String(invoiceId), // ⬅️ Изминнения 04.11.2025 13:33
               },
             },
           ],

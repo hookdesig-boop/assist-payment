@@ -432,7 +432,7 @@ bot.on("text", async (ctx) => {
 
     await ctx.reply(
       `✅ Номер заказа: ${orderNumber}\n\n` +
-        `🎬 Теперь выберите количество адаптаций:`,
+        `🎬 Теперь выберите количество гео(стран) для адаптации:`,
       Markup.inlineKeyboard([
         [
           Markup.button.callback("1", "adaptations_1"),
@@ -464,7 +464,7 @@ bot.on("text", async (ctx) => {
 
     await ctx.reply(
       `✅ Банк: ${bank}\n\n` +
-        `💰 Теперь укажите сумму выигрыша (только цифры):`
+        `💰 Теперь укажите примерную сумму общего выигрыша в доларах (только цифры):`
     );
     return;
   }
@@ -590,7 +590,7 @@ bot.action(/currency_(.+)/, async (ctx) => {
     await ctx.editMessageText(
       `🎉 Все адаптации настроены!\n\n` +
         `${adaptationsSummary}\n\n` +
-        `🏦 Теперь укажите название банка:`
+        `🏦  Теперь укажите название банка(ов) для ваших гео  - Bank/Bank`
     );
   }
 

@@ -24,21 +24,21 @@ global.autoCheckInterval = null;
 
 // ========== УТИЛИТЫ ДЛЯ ОТЛАДКИ ==========
 
-function debugSession(ctx) {
-  console.log("🔍 DEBUG SESSION:", {
-    userId: ctx.from?.id,
-    session: ctx.session,
-    invoiceId: ctx.session?.invoiceId,
-    pendingPaymentsSize: pendingPayments.size,
-    pendingPayments: Array.from(pendingPayments.entries()).map(
-      ([id, data]) => ({
-        invoiceId: id,
-        userId: data.userId,
-        orderNumber: data.order?.orderNumber,
-      })
-    ),
-  });
-}
+// function debugSession(ctx) {
+//   console.log("🔍 DEBUG SESSION:", {
+//     userId: ctx.from?.id,
+//     session: ctx.session,
+//     invoiceId: ctx.session?.invoiceId,
+//     pendingPaymentsSize: pendingPayments.size,
+//     pendingPayments: Array.from(pendingPayments.entries()).map(
+//       ([id, data]) => ({
+//         invoiceId: id,
+//         userId: data.userId,
+//         orderNumber: data.order?.orderNumber,
+//       })
+//     ),
+//   });
+// }
 
 // ========== СИСТЕМА ПРОВЕРКИ ПЛАТЕЖЕЙ ==========
 
@@ -124,7 +124,7 @@ async function processSuccessfulPayment(
       winningAmount: order.winningAmount,
       additionalInfo: order.additionalInfo,
       paymentStatus: "paid",
-      invoiceId: String(invoiceId), // ⬅️ ИСПРАВЛЕНО: преобразование в строку
+      invoiceId: String(invoiceId), 
     });
 
     if (notionTask && notionTask.id) {
@@ -324,7 +324,7 @@ async function createInvoice(ctx) {
     const chatId = ctx.chat.id;
 
     const priceInfo = calculateOrderPrice(order);
-    const amount = priceInfo.adaptationsPrice * 1.03;
+    const amount = priceInfo.adaptationsPrice;
     const description = `Заказ #${order.orderNumber} - ${order.adaptationsCount} адаптаций`;
 
     console.log(
